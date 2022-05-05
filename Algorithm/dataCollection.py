@@ -3,7 +3,7 @@
 # Author: Zane Hampton
 #
 # Created: 26/04/2022
-# Last Edit: 01/05/2022
+# Last Edit: 05/05/2022
 #
 # Version: 0.01.00
 #
@@ -25,6 +25,7 @@ import pandas as pd
 import os
 import requests
 import yfinance as yf
+from scipy import stats
 
 def convertToString(stockTickers):
     if type(stockTickers) == str:
@@ -120,12 +121,28 @@ class requestData:
         monthlyRoR = self.averageMonthlyReturn(stockTickers)
         
         fundamentalsDf.insert(3,'RoR',monthlyRoR.values(),True)
+        fundamentalsDf.reset_index(drop=True,inplace=True)
         return fundamentalsDf
+    
+    def stocksRanked(self, stockTickers: list):
+        finData = self.completeData(stockTickers)
+
+        for row in finData.index:
+            for column in range(1,4):
+                finData.iloc[row,column] = stats.percentileofscore(
+                                                            finData.iloc[:,column],
+                                                            finData.iloc[row,column],
+                                                            )
+        finData["sum"] = finData.sum(axis=1, numeric_only=True)
+        rankStocks = finData.iloc[:,[0,4]]
+        rankStocks.sort_values(by=['sum'],ascending=False,inplace=True)
+        rankStocks.reset_index(drop=True,inplace=True)
+        return rankStocks
+    
 
 if __name__ == '__main__':
     getData = requestData(sandbox = True)
-    stockList = ['TWTR', 'GOOG', 'WFC']
-    
-    testDataFrame = getData.completeData(stockList)
-    print(testDataFrame)
+    stockList = ['NFLX','GOOG','AAPL']
+    dataframe = getData.stocksRanked(stockList)
+    print(dataframe)
     None
