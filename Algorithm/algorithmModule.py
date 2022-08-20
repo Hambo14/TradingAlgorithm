@@ -29,6 +29,7 @@ from scipy import stats
 from bs4 import BeautifulSoup as bs
 import multiprocessing as mp
 from datetime import datetime
+import json
 
 def convertToString(stockTickers):
     if type(stockTickers) == str:
@@ -49,14 +50,24 @@ class requestError(Exception):
 # Following class will be used to determine each stock on the SPX ranking
 class requestData:
 
+    '''requestData class is used to retrieve financial data and to rank the stocks'''
+
     def __init__(self, sandbox: bool) -> None:
 
         if sandbox == True:
             self.base_url = 'https://sandbox.iexapis.com/stable/'
-            self.token = os.environ.get('IEX_SANDBOX_TOKEN')
+            try:
+                with open("secrets.json") as f:
+                    self.token = json.load(f)['IEX_SANDBOX_TOKEN']
+            except:
+                self.token = os.environ.get('IEX_SANDBOX_TOKEN')
         else:
             self.base_url = 'https://cloud.iexapis.com/v1'
-            self.token = os.environ.get('IEX_TOKEN')
+            try:
+                with open("secrets.json") as f:
+                    self.token = json.load(f)['IEX_TOKEN']
+            except:
+                self.token = os.environ.get('IEX_TOKEN')
 
         self.params = {'token':self.token}
         pass
@@ -198,6 +209,10 @@ class portfolio:
         self._portfolio = None
         self._orderHistory = None
         self._portfolioValue = portfolioValue
+
+        valueDict = {"Date": [datetime.today().strftime('%Y-%m-%d')],
+                     "Portfolio Value": [portfolioValue]}
+        self._valueOverTime = pd.DataFrame(valueDict)
         pass
 
     @staticmethod
@@ -235,9 +250,69 @@ class portfolio:
 
         orderHistoryDict = {'Ticker': stocksToBuy,
                             'Shares Bought/Sold': numberOfShares,
+                            'Share Price': sharePrices.loc[stocksToBuy,'Price'].values,
                             'Order Date': datetime.today().strftime('%Y-%m-%d')}
         orderHistoryDf = pd.DataFrame(orderHistoryDict)
         self._orderHistory = orderHistoryDf
+
+        None
+
+    def updatePortfolio(self):
+        stockList = self._portfolio.loc[:,"Ticker"].values
+        newHistoricalData = self.dataRequester.historicalData(stockList)
+        newStockPrices = []
+        for stock in stockList:
+            newStockPrice = pd.json_normalize(newHistoricalData[stock],record_path=['chart']).tail(1)["close"].values[0]
+            newStockPrices.append(newStockPrice)
+
+        holdingAmount = []
+        for i, stockPrice in enumerate(newStockPrices):
+            holdingAmount.append(stockPrice*self._portfolio.loc[i,"Number of Shares"])
+        
+        self._portfolio["Holding Amount"] = holdingAmount
+
+        newValue = sum(self._portfolio["Holding Amount"].values)
+        valueDict = {"Date": [datetime.today().strftime('%Y-%m-%d')],
+                     "Portfolio Value": [newValue]}
+        self._valueOverTime = self._valueOverTime.append(pd.DataFrame(valueDict))
+        self._portfolioValue = newValue
+
+        None
+
+    def rebalancePortfolio(self):
+        stockList = self.spxList()['Symbol']
+        stocksToBuy = self.dataRequester.stocksRanked(stockList[0:25])
+        stocksToBuy = stocksToBuy.loc[0:9,'Ticker']
+
+        numberOfShares = []
+        holdingAmount = []
+        amountToBuy = []
+        sharePrices = self.spxList()[['Symbol','Price']]
+        sharePrices.set_index('Symbol', inplace=True)
+        for stock in stocksToBuy:
+            price = sharePrices.loc[stock, 'Price']
+            shareNumber = (self._portfolioValue/len(stocksToBuy))/price
+            numberOfShares.append(shareNumber)
+            holdingAmount.append(price*shareNumber)
+        
+            if (stock in self._portfolio["Ticker"].values):
+                sharesOwned = self._portfolio.loc[self._portfolio["Ticker"] == stock].values[0][1]
+                amountToBuy.append(shareNumber - sharesOwned)
+            else:
+                amountToBuy.append(shareNumber)
+
+        portfolioDict = {'Ticker': stocksToBuy,
+                         'Number of Shares': numberOfShares,
+                         'Holding Amount': holdingAmount}
+        portfolioDf = pd.DataFrame(portfolioDict)
+        self._portfolio = portfolioDf
+
+        orderHistoryDict = {'Ticker': stocksToBuy,
+                            'Shares Bought/Sold': amountToBuy,
+                            'Share Price': sharePrices.loc[stocksToBuy,'Price'].values,
+                            'Order Date': datetime.today().strftime('%Y-%m-%d')}
+        orderHistoryDf = pd.DataFrame(orderHistoryDict)
+        self._orderHistory = self._orderHistory.append(orderHistoryDf)
 
         None
 
@@ -245,6 +320,5 @@ if __name__ == '__main__':
     getData = requestData(sandbox = True)
     portfolio = portfolio(sandbox = True, portfolioValue = 100000)
     portfolio.createPortfolio()
-    print(portfolio._portfolio)
-    print(portfolio._orderHistory)
+    portfolio.updatePortfolio()
     None
