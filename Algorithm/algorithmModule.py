@@ -3,7 +3,7 @@
 # Author: Zane Hampton
 #
 # Created: 26/04/2022
-# Last Edit: 05/05/2022
+# Last Edit: 21/08/2022
 #
 # Version: 0.01.00
 #
@@ -16,8 +16,9 @@
 # Historical price data is sourced using the IEX Cloud API. In order
 # for the data to be successfully requested, you need to have a
 # valid IEX Cloud Token saved into your environment variables as
-# IEX_TOKEN. The fundamental ratios used in the algorithm is sourced
-# using yfinance.
+# IEX_TOKEN and IEX_SANDBOX_TOKEN. The fundamental ratios used in 
+# the algorithm is sourced using yfinance. Data is stored into SQLite3
+# database.
 #
 #-------------------------------------------------------------------
 
@@ -30,6 +31,7 @@ from bs4 import BeautifulSoup as bs
 import multiprocessing as mp
 from datetime import datetime
 import json
+import sqlite3
 
 def convertToString(stockTickers):
     if type(stockTickers) == str:
@@ -205,15 +207,41 @@ class portfolio:
     requestData.stocksRanked(), and then pick the highest ranking stocks'''
 
     def __init__(self, sandbox: bool, portfolioValue) -> None:
-        self.dataRequester = requestData(sandbox)
-        self._portfolio = None
-        self._orderHistory = None
-        self._portfolioValue = portfolioValue
 
-        valueDict = {"Date": [datetime.today().strftime('%Y-%m-%d')],
-                     "Portfolio Value": [portfolioValue]}
-        self._valueOverTime = pd.DataFrame(valueDict)
-        pass
+        self.dataRequester = requestData(sandbox)
+
+        # SET UP THE SQLITE DATABASE TO STORE DATA
+        conn = sqlite3.connect('portfolio.db')
+        c = conn.cursor()
+
+        try:
+            c.execute("""CREATE TABLE portfolioValue(Date INT,Value REAL)""")
+            c.execute("""CREATE TABLE portfolio(Ticker TEXT, numShares REAL, holdAmount REAL)""")
+            c.execute("""CREATE TABLE orderHistory(Date INT, Ticker TEXT, sharesBought REAL, sharePrice REAL)""")
+        except:
+            None
+        c.execute(f"INSERT INTO portfolioValue VALUES ({int(datetime.today().strftime('%Y%m%d'))},{portfolioValue})")
+
+        conn.commit()
+        conn.close()
+
+        None
+
+    def portfolioValue(self):
+        
+        # RETRIEVE THE LATEST VALUE OF THE PORTFOLIO
+        conn = sqlite3.connect('portfolio.db')
+        c = conn.cursor()
+        c.execute("""SELECT Value 
+                     FROM portfolioValue 
+                     WHERE Date = (
+                        SELECT MAX(Date)
+                        FROM portfolioValue
+                     )""")
+        conn.commit()
+        self._portfolioValue = c.fetchone()[0]
+        conn.close()
+        return self._portfolioValue
 
     @staticmethod
     def spxList():
@@ -231,33 +259,52 @@ class portfolio:
         stockList = self.spxList()['Symbol']
         stocksToBuy = self.dataRequester.stocksRanked(stockList[0:25])
         stocksToBuy = stocksToBuy.loc[0:9,'Ticker']
+        portfolioValue = self.portfolioValue()
 
-        numberOfShares = []
-        holdingAmount = []
+        portfolioRow = []
+        orderHistoryRow = []
         sharePrices = self.spxList()[['Symbol','Price']]
         sharePrices.set_index('Symbol', inplace=True)
         for stock in stocksToBuy:
             price = sharePrices.loc[stock, 'Price']
-            shareNumber = (self._portfolioValue/len(stocksToBuy))/price
-            numberOfShares.append(shareNumber)
-            holdingAmount.append(price*shareNumber)
-
-        portfolioDict = {'Ticker': stocksToBuy,
-                         'Number of Shares': numberOfShares,
-                         'Holding Amount': holdingAmount}
-        portfolioDf = pd.DataFrame(portfolioDict)
-        self._portfolio = portfolioDf
-
-        orderHistoryDict = {'Ticker': stocksToBuy,
-                            'Shares Bought/Sold': numberOfShares,
-                            'Share Price': sharePrices.loc[stocksToBuy,'Price'].values,
-                            'Order Date': datetime.today().strftime('%Y-%m-%d')}
-        orderHistoryDf = pd.DataFrame(orderHistoryDict)
-        self._orderHistory = orderHistoryDf
+            shareNumber = (portfolioValue/len(stocksToBuy))/price
+            holdingAmount = price*shareNumber
+            portfolioRow.append(tuple([stock,shareNumber,holdingAmount]))
+            orderHistoryRow.append(tuple(
+                [int(datetime.today().strftime('%Y%m%d')),
+                stock,
+                shareNumber,
+                price]))
+            
+        conn = sqlite3.connect('portfolio.db')
+        c = conn.cursor()
+        c.executemany("INSERT INTO portfolio VALUES (?,?,?);",portfolioRow)
+        c.executemany("INSERT INTO orderHistory VALUES (?,?,?,?);",orderHistoryRow)
+        conn.commit()
+        conn.close()
 
         None
 
+    def portfolio(self):
+
+        conn = sqlite3.connect('portfolio.db')
+        portfolioDf = pd.read_sql_query("SELECT * FROM portfolio",conn)
+        conn.close()
+        self._portfolio = portfolioDf
+
+        return portfolioDf
+    
+    def orderHistory(self):
+
+        conn = sqlite3.connect('portfolio.db')
+        orderHistoryDf = pd.read_sql_query("SELECT * FROM orderHistory", conn)
+        conn.close()
+        self._orderHistory = orderHistoryDf
+
+        return orderHistoryDf
+
     def updatePortfolio(self):
+        self.portfolio()
         stockList = self._portfolio.loc[:,"Ticker"].values
         newHistoricalData = self.dataRequester.historicalData(stockList)
         newStockPrices = []
@@ -265,60 +312,57 @@ class portfolio:
             newStockPrice = pd.json_normalize(newHistoricalData[stock],record_path=['chart']).tail(1)["close"].values[0]
             newStockPrices.append(newStockPrice)
 
-        holdingAmount = []
+        portfolioRow = []
+        stockRow = []
         for i, stockPrice in enumerate(newStockPrices):
-            holdingAmount.append(stockPrice*self._portfolio.loc[i,"Number of Shares"])
+            holdingAmount = stockPrice*self._portfolio.loc[i,"numShares"]
+            portfolioRow.append(tuple([holdingAmount]))
+            stockRow.append(tuple([stockList[i]]))
         
-        self._portfolio["Holding Amount"] = holdingAmount
+        conn = sqlite3.connect('portfolio.db')
+        c = conn.cursor()
+        for hold, stock in zip(portfolioRow,stockRow):
+            c.execute("UPDATE portfolio SET holdAmount = (?) WHERE Ticker = (?)",(hold[0],stock[0],))
 
-        newValue = sum(self._portfolio["Holding Amount"].values)
-        valueDict = {"Date": [datetime.today().strftime('%Y-%m-%d')],
-                     "Portfolio Value": [newValue]}
-        self._valueOverTime = self._valueOverTime.append(pd.DataFrame(valueDict))
-        self._portfolioValue = newValue
+        d = conn.cursor()
+        d.execute("SELECT holdAmount FROM portfolio")
+        portfolioValue = sum([i[0] for i in d.fetchall()])
+        c.execute("INSERT INTO portfolioValue VALUES (?,?)",(int(datetime.today().strftime('%Y%m%d')),portfolioValue))
+        
+        conn.commit()
+        conn.close()
 
         None
 
     def rebalancePortfolio(self):
+        self.portfolioValue()
+        self.portfolio()
         stockList = self.spxList()['Symbol']
         stocksToBuy = self.dataRequester.stocksRanked(stockList[0:25])
         stocksToBuy = stocksToBuy.loc[0:9,'Ticker']
 
-        numberOfShares = []
-        holdingAmount = []
-        amountToBuy = []
         sharePrices = self.spxList()[['Symbol','Price']]
         sharePrices.set_index('Symbol', inplace=True)
+        conn = sqlite3.connect('portfolio.db')
+        c = conn.cursor()
+        c.execute("DELETE FROM portfolio;")
         for stock in stocksToBuy:
             price = sharePrices.loc[stock, 'Price']
             shareNumber = (self._portfolioValue/len(stocksToBuy))/price
-            numberOfShares.append(shareNumber)
-            holdingAmount.append(price*shareNumber)
+            holdingAmount = price*shareNumber
         
             if (stock in self._portfolio["Ticker"].values):
                 sharesOwned = self._portfolio.loc[self._portfolio["Ticker"] == stock].values[0][1]
-                amountToBuy.append(shareNumber - sharesOwned)
+                amountToBuy = shareNumber - sharesOwned
             else:
-                amountToBuy.append(shareNumber)
+                amountToBuy = shareNumber
 
-        portfolioDict = {'Ticker': stocksToBuy,
-                         'Number of Shares': numberOfShares,
-                         'Holding Amount': holdingAmount}
-        portfolioDf = pd.DataFrame(portfolioDict)
-        self._portfolio = portfolioDf
-
-        orderHistoryDict = {'Ticker': stocksToBuy,
-                            'Shares Bought/Sold': amountToBuy,
-                            'Share Price': sharePrices.loc[stocksToBuy,'Price'].values,
-                            'Order Date': datetime.today().strftime('%Y-%m-%d')}
-        orderHistoryDf = pd.DataFrame(orderHistoryDict)
-        self._orderHistory = self._orderHistory.append(orderHistoryDf)
+            c.execute("INSERT INTO portfolio VALUES (?,?,?);",(stock,shareNumber,holdingAmount))
+            c.execute("INSERT INTO orderHistory VALUES (?,?,?,?)",(int(datetime.today().strftime('%Y%m%d')),stock,amountToBuy,price))
+        conn.commit()
+        conn.close()
 
         None
 
 if __name__ == '__main__':
-    getData = requestData(sandbox = True)
-    portfolio = portfolio(sandbox = True, portfolioValue = 100000)
-    portfolio.createPortfolio()
-    portfolio.updatePortfolio()
     None
